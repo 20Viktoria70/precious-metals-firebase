@@ -1,0 +1,16 @@
+# Секретні ключі та налаштування
+*.json
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Середовище
+venv/
+.venv/
+
+# Системні файли
+.DS_Store
