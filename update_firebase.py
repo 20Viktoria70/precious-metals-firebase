@@ -11,7 +11,6 @@ import yfinance as yf
 import firebase_admin
 
 from datetime import date, timedelta
-from io import StringIO
 from firebase_admin import credentials, db
 
 
@@ -40,9 +39,6 @@ metadata_ref = db.reference("metadata")
 # 2. НАЛАШТУВАННЯ ПЕРІОДУ ЗАВАНТАЖЕННЯ
 # ============================================================
 
-# Завантажуємо останні 30 днів.
-# Це дозволяє врахувати затримки та виправлення даних.
-
 end_date = date.today()
 start_date = end_date - timedelta(days=30)
 
@@ -53,7 +49,7 @@ print(f"Період завантаження: {start_str} - {end_str}")
 
 
 # ============================================================
-# 3. ЗАВАНТАЖЕННЯ ДАНИХ JOHNSON MATTHEY
+# 3. НАЛАШТУВАННЯ ДЖЕРЕЛ ДАНИХ
 # ============================================================
 
 JM_URL = (
@@ -64,6 +60,8 @@ JM_URL = (
     "&p_p_mode=view&p_p_cacheability=cacheLevelPage"
 )
 
+KITCO_API = "https://www.kitco.com/api/proxy-historical-data"
+
 JM_METALS = {
     "Platinum": "Pt",
     "Palladium": "Pd",
@@ -72,6 +70,47 @@ JM_METALS = {
     "Ruthenium": "Ru"
 }
 
+KITCO_METALS = {
+    "AU": "Gold_Kitco",
+    "AG": "Silver_Kitco",
+    "PT": "Platinum_Kitco",
+    "PD": "Palladium_Kitco"
+}
+
+INDICATORS = [
+    "Gold",
+    "Silver",
+    "Platinum",
+    "Palladium",
+    "Rhodium",
+    "Iridium",
+    "Ruthenium",
+    "SP500",
+    "FTSE100"
+]
+
+
+# ============================================================
+# 4. ДОПОМІЖНА ФУНКЦІЯ ДЛЯ ЧИСЛОВИХ ЗНАЧЕНЬ
+# ============================================================
+
+def to_number(value):
+
+    if isinstance(value, dict):
+        value = value.get("USD")
+
+    if value is None:
+        return None
+
+    return pd.to_numeric(
+        str(value).replace(",", ""),
+        errors="coerce"
+    )
+
+
+# ============================================================
+# 5. ЗАВАНТАЖЕННЯ ДАНИХ JOHNSON MATTHEY
+# ============================================================
 
 def download_jm_metals(start_date, end_date):
 
@@ -85,15 +124,35 @@ def download_jm_metals(start_date, end_date):
             "interval": "daily",
             "metals": ",".join(JM_METALS.values())
         },
+        headers={
+            "User-Agent": "Mozilla/5.0"
+        },
         timeout=60
     )
 
     response.raise_for_status()
 
-    result = response.json()
+    try:
+        result = response.json()
+    except ValueError:
+        raise ValueError(
+            "Johnson Matthey повернув не JSON: "
+            + response.text[:300]
+        )
+
+    if not isinstance(result, dict) or "url" not in result:
+        raise ValueError(
+            "У відповіді Johnson Matthey немає посилання на CSV."
+        )
+
     csv_url = result["url"]
 
     df = pd.read_csv(csv_url, header=1)
+
+    if "Date" not in df.columns:
+        raise ValueError(
+            "У файлі Johnson Matthey відсутня колонка Date."
+        )
 
     df["Date"] = pd.to_datetime(
         df["Date"],
@@ -103,11 +162,9 @@ def download_jm_metals(start_date, end_date):
     df = df.dropna(subset=["Date"])
 
     for metal in JM_METALS:
+
         if metal in df.columns:
-            df[metal] = pd.to_numeric(
-                df[metal].astype(str).str.replace(",", ""),
-                errors="coerce"
-            )
+            df[metal] = df[metal].apply(to_number)
 
     df = df.rename(columns={
         metal: f"{metal}_Matthey"
@@ -124,18 +181,8 @@ def download_jm_metals(start_date, end_date):
 
 
 # ============================================================
-# 4. ЗАВАНТАЖЕННЯ ДАНИХ KITCO
+# 6. ЗАВАНТАЖЕННЯ ДАНИХ KITCO
 # ============================================================
-
-KITCO_API = "https://www.kitco.com/api/proxy-historical-data"
-
-KITCO_METALS = {
-    "AU": "Gold_Kitco",
-    "AG": "Silver_Kitco",
-    "PT": "Platinum_Kitco",
-    "PD": "Palladium_Kitco"
-}
-
 
 def download_kitco(start_date, end_date):
 
@@ -151,15 +198,42 @@ def download_kitco(start_date, end_date):
         response = requests.get(
             KITCO_API,
             params={"year": year},
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={
+                "User-Agent": "Mozilla/5.0"
+            },
             timeout=60
         )
 
         response.raise_for_status()
 
-        year_data = response.json()
+        try:
+            year_data = response.json()
+        except ValueError:
+            raise ValueError(
+                "Kitco повернув не JSON: "
+                + response.text[:300]
+            )
+
+        if not isinstance(year_data, dict):
+            raise ValueError(
+                "Невідомий формат відповіді Kitco."
+            )
 
         raw_data = year_data.get("data", [])
+
+        # Іноді дані можуть бути JSON-рядком.
+
+        if isinstance(raw_data, str):
+
+            try:
+                raw_data = json.loads(raw_data)
+            except ValueError:
+                raise ValueError(
+                    "Kitco повернув текст замість списку даних: "
+                    + raw_data[:300]
+                )
+
+        # Обробка списку або словника.
 
         if isinstance(raw_data, dict):
 
@@ -168,8 +242,10 @@ def download_kitco(start_date, end_date):
             for key, value in raw_data.items():
 
                 if isinstance(value, dict):
+
                     day_info = value.copy()
                     day_info.setdefault("date", key)
+
                     data_items.append(day_info)
 
         elif isinstance(raw_data, list):
@@ -178,7 +254,7 @@ def download_kitco(start_date, end_date):
 
         else:
             raise ValueError(
-                f"Невідомий формат відповіді Kitco: {type(raw_data)}"
+                f"Невідомий тип даних Kitco: {type(raw_data)}"
             )
 
         for day_info in data_items:
@@ -187,29 +263,32 @@ def download_kitco(start_date, end_date):
                 continue
 
             day = pd.to_datetime(
-                day_info.get("date"),
+                day_info.get("date", day_info.get("Date")),
                 errors="coerce"
             )
 
-            if pd.isna(day) or day < start or day > end:
+            if pd.isna(day):
                 continue
 
-            hub_data = (
-                day_info.get("hubs", {}).get("London", {})
-            )
+            if day < start or day > end:
+                continue
+
+            hubs = day_info.get("hubs", {})
+
+            if not isinstance(hubs, dict):
+                continue
+
+            hub_data = hubs.get("London", {})
+
+            if not isinstance(hub_data, dict):
+                continue
 
             row = {"Date": day}
 
             for code, column in KITCO_METALS.items():
 
-                value = hub_data.get(code)
-
-                if isinstance(value, dict):
-                    value = value.get("USD")
-
-                row[column] = pd.to_numeric(
-                    value,
-                    errors="coerce"
+                row[column] = to_number(
+                    hub_data.get(code)
                 )
 
             records.append(row)
@@ -228,105 +307,9 @@ def download_kitco(start_date, end_date):
 
     return df
 
-        # Kitco може повертати дані у вигляді списку
-        # або словника з датами як ключами.
-
-        if isinstance(raw_data, dict):
-
-            data_items = []
-
-            for key, value in raw_data.items():
-
-                if isinstance(value, dict):
-                    day_info = value.copy()
-                    day_info.setdefault("date", key)
-                    data_items.append(day_info)
-
-        elif isinstance(raw_data, list):
-
-            data_items = raw_data
-
-        else:
-            raise ValueError(
-                f"Невідомий формат відповіді Kitco: {type(raw_data)}"
-            )
-
-        for day_info in data_items:
-
-            if not isinstance(day_info, dict):
-                continue
-
-            day = pd.to_datetime(
-                day_info.get("date"),
-                errors="coerce"
-            )
-
-            if pd.isna(day) or day < start or day > end:
-                continue
-
-            hub_data = (
-                day_info.get("hubs", {}).get("London", {})
-            )
-
-            row = {"Date": day}
-
-            for code, column in KITCO_METALS.items():
-
-                value = hub_data.get(code)
-
-                if isinstance(value, dict):
-                    value = value.get("USD")
-
-                row[column] = pd.to_numeric(
-                    value,
-                    errors="coerce"
-                )
-
-            records.append(row)
-
-            day = pd.to_datetime(
-                day_info.get("date"),
-                errors="coerce"
-            )
-
-            if pd.isna(day) or day < start or day > end:
-                continue
-
-            hub_data = (
-                day_info.get("hubs", {}).get("London", {})
-            )
-
-            row = {"Date": day}
-
-            for code, column in KITCO_METALS.items():
-
-                value = hub_data.get(code)
-
-                if isinstance(value, dict):
-                    value = value.get("USD")
-
-                row[column] = pd.to_numeric(
-                    value,
-                    errors="coerce"
-                )
-
-            records.append(row)
-
-    df = pd.DataFrame(records)
-
-    if df.empty:
-        raise ValueError("Kitco не повернув даних за вибраний період.")
-
-    df = df.drop_duplicates(subset=["Date"])
-    df = df.sort_values("Date")
-
-    print("Kitco:", len(df), "записів")
-
-    return df
-
 
 # ============================================================
-# 5. ЗАВАНТАЖЕННЯ ДАНИХ З YAHOO FINANCE
+# 7. ЗАВАНТАЖЕННЯ ДАНИХ YAHOO FINANCE
 # ============================================================
 
 def download_yahoo_metals(start_date, end_date):
@@ -351,6 +334,7 @@ def download_yahoo_metals(start_date, end_date):
         )
 
         if data.empty:
+            print("Немає даних для", ticker)
             continue
 
         close = data["Close"]
@@ -364,14 +348,22 @@ def download_yahoo_metals(start_date, end_date):
         result.append(temp)
 
     if not result:
-        raise ValueError("Yahoo Finance не повернув ціни металів.")
+        raise ValueError(
+            "Yahoo Finance не повернув ціни металів."
+        )
 
     df = result[0]
 
     for temp in result[1:]:
-        df = df.merge(temp, on="Date", how="outer")
+        df = df.merge(
+            temp,
+            on="Date",
+            how="outer"
+        )
 
-    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+    df["Date"] = pd.to_datetime(
+        df["Date"]
+    ).dt.tz_localize(None)
 
     print("Yahoo Finance (метали):", len(df), "записів")
 
@@ -379,7 +371,7 @@ def download_yahoo_metals(start_date, end_date):
 
 
 # ============================================================
-# 6. ЗАВАНТАЖЕННЯ ЕКОНОМІЧНИХ ІНДЕКСІВ
+# 8. ЗАВАНТАЖЕННЯ ЕКОНОМІЧНИХ ІНДЕКСІВ
 # ============================================================
 
 def download_economic_indices(start_date, end_date):
@@ -404,6 +396,7 @@ def download_economic_indices(start_date, end_date):
         )
 
         if data.empty:
+            print("Немає даних для", ticker)
             continue
 
         close = data["Close"]
@@ -417,14 +410,22 @@ def download_economic_indices(start_date, end_date):
         result.append(temp)
 
     if not result:
-        raise ValueError("Не вдалося отримати економічні індекси.")
+        raise ValueError(
+            "Не вдалося отримати економічні індекси."
+        )
 
     df = result[0]
 
     for temp in result[1:]:
-        df = df.merge(temp, on="Date", how="outer")
+        df = df.merge(
+            temp,
+            on="Date",
+            how="outer"
+        )
 
-    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+    df["Date"] = pd.to_datetime(
+        df["Date"]
+    ).dt.tz_localize(None)
 
     print("Економічні індекси:", len(df), "записів")
 
@@ -432,111 +433,188 @@ def download_economic_indices(start_date, end_date):
 
 
 # ============================================================
-# 7. ОБ'ЄДНАННЯ ДАНИХ
+# 9. БЕЗПЕЧНЕ ЗАВАНТАЖЕННЯ ДЖЕРЕЛ
 # ============================================================
 
 print("\nПочаток завантаження даних...\n")
 
-# Завантаження Johnson Matthey
+source_frames = []
+successful_sources = []
+
+# Johnson Matthey
+
 try:
+
     df_jm = download_jm_metals(start_str, end_str)
-    jm_available = True
+
+    source_frames.append(df_jm)
+    successful_sources.append("Johnson Matthey")
 
 except Exception as error:
+
     print("ПОПЕРЕДЖЕННЯ: Johnson Matthey недоступний.")
     print("Причина:", error)
 
-    df_jm = pd.DataFrame(columns=[
-        "Date",
-        "Platinum_Matthey",
-        "Palladium_Matthey",
-        "Rhodium_Matthey",
-        "Iridium_Matthey",
-        "Ruthenium_Matthey"
-    ])
 
-    jm_available = False
+# Kitco
+
+try:
+
+    df_kitco = download_kitco(start_str, end_str)
+
+    source_frames.append(df_kitco)
+    successful_sources.append("Kitco")
+
+except Exception as error:
+
+    print("ПОПЕРЕДЖЕННЯ: Kitco недоступний.")
+    print("Причина:", error)
 
 
-# Завантаження інших джерел
-df_kitco = download_kitco(start_str, end_str)
-df_yahoo = download_yahoo_metals(start_date, end_date)
-df_indices = download_economic_indices(start_date, end_date)
+# Yahoo Finance — метали
 
-# Об'єднання всіх джерел за датою
+try:
 
-df_all = (
-    df_jm
-    .merge(df_kitco, on="Date", how="outer")
-    .merge(df_yahoo, on="Date", how="outer")
-    .merge(df_indices, on="Date", how="outer")
+    df_yahoo = download_yahoo_metals(
+        start_date,
+        end_date
+    )
+
+    source_frames.append(df_yahoo)
+    successful_sources.append("Yahoo Finance Metals")
+
+except Exception as error:
+
+    print("ПОПЕРЕДЖЕННЯ: Yahoo Finance (метали) недоступний.")
+    print("Причина:", error)
+
+
+# Yahoo Finance — економічні індекси
+
+try:
+
+    df_indices = download_economic_indices(
+        start_date,
+        end_date
+    )
+
+    source_frames.append(df_indices)
+    successful_sources.append("Yahoo Finance Indices")
+
+except Exception as error:
+
+    print("ПОПЕРЕДЖЕННЯ: економічні індекси недоступні.")
+    print("Причина:", error)
+
+
+# Перевірка наявності даних
+
+if not source_frames:
+    raise RuntimeError(
+        "Не вдалося завантажити дані з жодного джерела."
+    )
+
+
+# ============================================================
+# 10. ОБ'ЄДНАННЯ ДАНИХ
+# ============================================================
+
+df_all = source_frames[0].copy()
+
+for frame in source_frames[1:]:
+
+    df_all = df_all.merge(
+        frame,
+        on="Date",
+        how="outer"
+    )
+
+df_all["Date"] = pd.to_datetime(
+    df_all["Date"],
+    errors="coerce"
 )
 
+df_all = df_all.dropna(subset=["Date"])
 df_all = df_all.sort_values("Date").reset_index(drop=True)
 
 
 # ============================================================
-# 8. ФОРМУВАННЯ ЄДИНОЇ ТАБЛИЦІ ПОКАЗНИКІВ
+# 11. ФОРМУВАННЯ ЄДИНОЇ ТАБЛИЦІ ПОКАЗНИКІВ
 # ============================================================
 
-# Для кожного показника встановлюємо пріоритет джерел.
-# combine_first використовує наступне джерело,
-# якщо в попередньому значення відсутнє.
+def get_column(df, name):
 
-df_all["Gold"] = (
-    df_all.get("Gold_Kitco", pd.Series(index=df_all.index, dtype=float))
-    .combine_first(
-        df_all.get("Gold_Yahoo", pd.Series(index=df_all.index, dtype=float))
+    if name in df.columns:
+        return df[name]
+
+    return pd.Series(
+        index=df.index,
+        dtype="float64"
     )
+
+
+# Золото: Kitco, потім Yahoo Finance.
+
+df_all["Gold"] = get_column(
+    df_all, "Gold_Kitco"
+).combine_first(
+    get_column(df_all, "Gold_Yahoo")
 )
 
-df_all["Silver"] = (
-    df_all.get("Silver_Kitco", pd.Series(index=df_all.index, dtype=float))
-    .combine_first(
-        df_all.get("Silver_Yahoo", pd.Series(index=df_all.index, dtype=float))
-    )
+
+# Срібло: Kitco, потім Yahoo Finance.
+
+df_all["Silver"] = get_column(
+    df_all, "Silver_Kitco"
+).combine_first(
+    get_column(df_all, "Silver_Yahoo")
 )
+
+
+# Платина та паладій: Johnson Matthey, потім Kitco.
 
 for metal in ["Platinum", "Palladium"]:
-    df_all[metal] = (
-        df_all.get(f"{metal}_Matthey", pd.Series(index=df_all.index, dtype=float))
-        .combine_first(
-            df_all.get(f"{metal}_Kitco", pd.Series(index=df_all.index, dtype=float))
-        )
+
+    df_all[metal] = get_column(
+        df_all, f"{metal}_Matthey"
+    ).combine_first(
+        get_column(df_all, f"{metal}_Kitco")
     )
+
+
+# Інші метали: Johnson Matthey.
 
 for metal in ["Rhodium", "Iridium", "Ruthenium"]:
-    df_all[metal] = df_all.get(
-        f"{metal}_Matthey",
-        pd.Series(index=df_all.index, dtype=float)
+
+    df_all[metal] = get_column(
+        df_all, f"{metal}_Matthey"
     )
 
-indicators = [
-    "Gold",
-    "Silver",
-    "Platinum",
-    "Palladium",
-    "Rhodium",
-    "Iridium",
-    "Ruthenium",
-    "SP500",
-    "FTSE100"
-]
 
-# Залишаємо тільки потрібні показники
+# Перевірка всіх необхідних показників.
 
-df_final = df_all[["Date"] + indicators].copy()
+for indicator in INDICATORS:
 
-df_final["Date"] = pd.to_datetime(
-    df_final["Date"]
-).dt.strftime("%Y-%m-%d")
+    if indicator not in df_all.columns:
+        df_all[indicator] = pd.NA
+
+
+df_final = df_all[
+    ["Date"] + INDICATORS
+].copy()
+
+df_final["Date"] = df_final["Date"].dt.strftime(
+    "%Y-%m-%d"
+)
 
 print("\nОб'єднані дані:")
 print(df_final.tail())
 
+print("\nКількість завантажених записів:", len(df_final))
+
 
 # ============================================================
-# 9. ОНОВЛЕННЯ ІСТОРИЧНИХ ДАНИХ У FIREBASE
+# 12. ОНОВЛЕННЯ ІСТОРИЧНИХ ДАНИХ FIREBASE
 # ============================================================
 
 print("\nОновлення історичних даних Firebase...")
@@ -547,7 +625,7 @@ for _, row in df_final.iterrows():
 
     daily_data = {}
 
-    for indicator in indicators:
+    for indicator in INDICATORS:
 
         value = row[indicator]
 
@@ -558,10 +636,12 @@ for _, row in df_final.iterrows():
 
         date_key = row["Date"]
 
-        # update() додає або оновлює лише наявні поля.
-        # Старі значення інших показників не видаляються.
+        # Оновлюємо лише наявні значення.
+        # Старі показники та дати не видаляються.
 
-        historical_ref.child(date_key).update(daily_data)
+        historical_ref.child(date_key).update(
+            daily_data
+        )
 
         updated_records += 1
 
@@ -569,16 +649,18 @@ print("Оновлено дат:", updated_records)
 
 
 # ============================================================
-# 10. ОНОВЛЕННЯ ПОТОЧНИХ ЦІН
+# 13. ОНОВЛЕННЯ ПОТОЧНИХ ЦІН
 # ============================================================
 
 print("\nОновлення поточних цін...")
 
 current_data = current_ref.get() or {}
 
-for indicator in indicators:
+for indicator in INDICATORS:
 
-    available_data = df_final.dropna(subset=[indicator])
+    available_data = df_final.dropna(
+        subset=[indicator]
+    )
 
     if not available_data.empty:
 
@@ -591,29 +673,24 @@ for indicator in indicators:
 
 current_ref.update(current_data)
 
-print("Поточні ціни успішно оновлено.")
+print("Поточні ціни оновлено.")
 
 
 # ============================================================
-# 11. ОНОВЛЕННЯ МЕТАДАНИХ
+# 14. ОНОВЛЕННЯ МЕТАДАНИХ
 # ============================================================
 
 metadata_ref.update({
     "last_update": date.today().isoformat(),
-    "indicators": indicators,
-    "indicators_count": len(indicators),
+    "indicators": INDICATORS,
+    "indicators_count": len(INDICATORS),
     "last_update_records": updated_records,
-    "data_sources": (
-    ["Johnson Matthey"] if jm_available else []
-) + [
-    "Kitco",
-    "Yahoo Finance"
-]
+    "data_sources": successful_sources
 })
 
 
 # ============================================================
-# 12. ПЕРЕВІРКА РЕЗУЛЬТАТУ
+# 15. ПЕРЕВІРКА РЕЗУЛЬТАТУ
 # ============================================================
 
 print("\nПеревірка Firebase:")
@@ -631,6 +708,7 @@ print(
 print("\nПоточні ціни:")
 
 for indicator, info in current_data.items():
+
     print(
         indicator,
         "—",
@@ -638,5 +716,8 @@ for indicator, info in current_data.items():
         "дата:",
         info["date"]
     )
+
+print("\nДжерела, які надали дані:")
+print(successful_sources)
 
 print("\nОНОВЛЕННЯ FIREBASE ЗАВЕРШЕНО!")
