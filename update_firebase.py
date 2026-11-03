@@ -161,7 +161,63 @@ def download_kitco(start_date, end_date):
 
         year_data = response.json()
 
-        for day_info in year_data.get("data", []):
+                raw_data = year_data.get("data", [])
+
+        # Kitco може повертати дані у вигляді списку
+        # або словника з датами як ключами.
+
+        if isinstance(raw_data, dict):
+
+            data_items = []
+
+            for key, value in raw_data.items():
+
+                if isinstance(value, dict):
+                    day_info = value.copy()
+                    day_info.setdefault("date", key)
+                    data_items.append(day_info)
+
+        elif isinstance(raw_data, list):
+
+            data_items = raw_data
+
+        else:
+            raise ValueError(
+                f"Невідомий формат відповіді Kitco: {type(raw_data)}"
+            )
+
+        for day_info in data_items:
+
+            if not isinstance(day_info, dict):
+                continue
+
+            day = pd.to_datetime(
+                day_info.get("date"),
+                errors="coerce"
+            )
+
+            if pd.isna(day) or day < start or day > end:
+                continue
+
+            hub_data = (
+                day_info.get("hubs", {}).get("London", {})
+            )
+
+            row = {"Date": day}
+
+            for code, column in KITCO_METALS.items():
+
+                value = hub_data.get(code)
+
+                if isinstance(value, dict):
+                    value = value.get("USD")
+
+                row[column] = pd.to_numeric(
+                    value,
+                    errors="coerce"
+                )
+
+            records.append(row)
 
             day = pd.to_datetime(
                 day_info.get("date"),
