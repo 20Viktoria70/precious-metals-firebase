@@ -316,7 +316,28 @@ def download_economic_indices(start_date, end_date):
 
 print("\nПочаток завантаження даних...\n")
 
-df_jm = download_jm_metals(start_str, end_str)
+# Завантаження Johnson Matthey
+try:
+    df_jm = download_jm_metals(start_str, end_str)
+    jm_available = True
+
+except Exception as error:
+    print("ПОПЕРЕДЖЕННЯ: Johnson Matthey недоступний.")
+    print("Причина:", error)
+
+    df_jm = pd.DataFrame(columns=[
+        "Date",
+        "Platinum_Matthey",
+        "Palladium_Matthey",
+        "Rhodium_Matthey",
+        "Iridium_Matthey",
+        "Ruthenium_Matthey"
+    ])
+
+    jm_available = False
+
+
+# Завантаження інших джерел
 df_kitco = download_kitco(start_str, end_str)
 df_yahoo = download_yahoo_metals(start_date, end_date)
 df_indices = download_economic_indices(start_date, end_date)
@@ -461,11 +482,12 @@ metadata_ref.update({
     "indicators": indicators,
     "indicators_count": len(indicators),
     "last_update_records": updated_records,
-    "data_sources": [
-        "Johnson Matthey",
-        "Kitco",
-        "Yahoo Finance"
-    ]
+    "data_sources": (
+    ["Johnson Matthey"] if jm_available else []
+) + [
+    "Kitco",
+    "Yahoo Finance"
+]
 })
 
 
